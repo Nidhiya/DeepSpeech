@@ -4,11 +4,13 @@ from __future__ import absolute_import, division, print_function
 
 import functools
 import multiprocessing
+import numpy as np
 import os
 import pandas
 import tensorflow as tf
 
 from tensorflow.contrib.framework.python.ops import audio_ops as contrib_audio
+from util.audio import audiofile_to_input_vector
 from util.config import Config, initialize_globals
 from util.text import text_to_char_array
 from util.flags import create_flags, FLAGS
@@ -32,79 +34,65 @@ def read_csvs(csv_files):
     return source_data
 
 
-def sample_to_features(wav_filename, transcript):
-    samples = tf.read_file(wav_filename)
-    decoded = contrib_audio.decode_wav(samples, desired_channels=1)
+def samples_to_mfccs(samples, sample_rate):
+    spectrogram = contrib_audio.audio_spectrogram(samples, window_size=512, stride=320, magnitude_squared=True)
+    mfccs = contrib_audio.mfcc(spectrogram, sample_rate, dct_coefficient_count=Config.n_input)
 
-    # Reshape from [time, channels=1] into [batch=1, time], dummy batch needed for MFCC computation
-    samples = tf.reshape(decoded.audio, [1, -1])
-
-    stfts = tf.contrib.signal.stft(samples, frame_length=512, frame_step=320, fft_length=512, window_fn=tf.contrib.signal.hamming_window)
-    spectrograms = tf.abs(stfts)
-
-    # Warp the linear scale spectrograms into the mel-scale.
-    num_spectrogram_bins = tf.shape(stfts)[-1]
-    lower_edge_hertz, upper_edge_hertz, num_mel_bins = 0.0, 8000.0, Config.n_input
-    linear_to_mel_weight_matrix = tf.contrib.signal.linear_to_mel_weight_matrix(num_mel_bins, num_spectrogram_bins, 16000.0, lower_edge_hertz, upper_edge_hertz)
-    mel_spectrograms = tf.tensordot(spectrograms, linear_to_mel_weight_matrix, 1)
-    mel_spectrograms.set_shape(spectrograms.shape[:-1].concatenate(linear_to_mel_weight_matrix.shape[-1:]))
-
-    # Compute a stabilized log to get log-magnitude mel-scale spectrograms.
-    log_mel_spectrograms = tf.log(mel_spectrograms + 1e-6)
-
-    # Compute MFCCs from log_mel_spectrograms and take the first Config.n_input.
-    mfccs = tf.contrib.signal.mfccs_from_log_mel_spectrograms(log_mel_spectrograms)
-
-    # Remove batch dimension
-    mfccs = tf.squeeze(mfccs, [0])
+    tf.print('mfcc shape:', tf.shape(mfccs))
 
     # Add empty initial and final contexts
-    empty_context = tf.fill([Config.n_context, Config.n_input], 0.0)
-    with_context = tf.concat([empty_context, mfccs, empty_context], 0)
+    empty_context = tf.fill([1, Config.n_context, Config.n_input], 0.0)
+    mfccs = tf.concat([empty_context, mfccs, empty_context], 1)
 
-    # Add dummy batch and depth dimensions
-    depth = tf.expand_dims(tf.expand_dims(with_context, -1), 0)
-    windows = tf.extract_image_patches(images=depth,
-                                       ksizes=[1, 2*Config.n_context + 1, Config.n_input, 1],
-                                       strides=[1, 1, 1, 1],
-                                       rates=[1, 1, 1, 1],
-                                       padding='VALID')
-
-    # Remove dummy batch and depth dimensions and reshape into n_windows, window_width * n_input
-    windows = tf.reshape(windows, [-1, (2*Config.n_context + 1) * Config.n_input])
-
-    # features, features_len, transcript
-    return windows, tf.shape(windows)[0], transcript
+    return mfccs
 
 
-def create_model():
-    inputs = tf.keras.Input(shape=(None, (2*Config.n_context + 1) * Config.n_input))
-    x_len = tf.keras.Input(shape=(1,))
-    y = tf.keras.Input(shape=(None,))
+def samples_to_features(samples, sample_rate):
+    mfccs = samples_to_mfccs(samples, sample_rate)
+    # tf.print('after ctx:', tf.shape(mfccs))
 
-    clipped_relu = functools.partial(tf.keras.activations.relu, max_value=FLAGS.relu_clip)
+    window_width = 2*Config.n_context + 1
+    num_channels = Config.n_input
 
-    def TimeDistDense(*args, **kwargs):
-        return tf.keras.layers.TimeDistributed(tf.keras.layers.Dense(*args, **kwargs))
+    tf.print('shape before conv:', tf.shape(mfccs))
 
-    x = tf.keras.layers.Masking()
-    x = TimeDistDense(Config.n_hidden_1, activation=clipped_relu)(inputs)
-    x = tf.keras.layers.Dropout(FLAGS.dropout_rate)(x)
-    x = TimeDistDense(Config.n_hidden_2, activation=clipped_relu)(x)
-    x = tf.keras.layers.Dropout(FLAGS.dropout_rate)(x)
-    x = TimeDistDense(Config.n_hidden_3, activation=clipped_relu)(x)
-    x = tf.keras.layers.Dropout(FLAGS.dropout_rate)(x)
-    x = tf.keras.layers.LSTM(Config.n_cell_dim, return_sequences=True)(x)
-    x = TimeDistDense(Config.n_hidden_5, activation=clipped_relu)(x)
-    x = tf.keras.layers.Dropout(FLAGS.dropout_rate)(x)
-    x = TimeDistDense(Config.n_hidden_6)(x)
+    # Create a constant convolution filter using an identity matrix, so that the
+    # convolution returns patches of the input tensor as is, and we can create
+    # overlapping windows over the MFCCs.
+    eye_filter = tf.constant(np.eye(window_width * num_channels)
+                               .reshape(window_width, num_channels, window_width * num_channels), tf.float32)
 
-    return tf.keras.Model(inputs=inputs, outputs=x)
+    # Create overlapping windows
+    mfccs = tf.nn.conv1d(mfccs, eye_filter, stride=1, padding='VALID')
+
+    tf.print('shape after conv:', tf.shape(mfccs))
+
+    # Remove dummy depth dimension and reshape into n_windows, window_width, window_height
+    mfccs = tf.reshape(mfccs, [-1, window_width, num_channels])
+
+    # tf.print('after windows:', tf.shape(mfccs))
+
+    return mfccs, tf.shape(mfccs)[0]
+
+
+def file_to_features(wav_filename, transcript):
+    samples = tf.read_file(wav_filename)
+    decoded = contrib_audio.decode_wav(samples, desired_channels=1)
+    features, features_len = samples_to_features(decoded.audio, decoded.sample_rate)
+
+    return features, features_len, transcript
+
+
+def file_to_mfccs(wav_filename, transcript):
+    samples = tf.read_file(wav_filename)
+    decoded = contrib_audio.decode_wav(samples, desired_channels=1)
+    return samples_to_mfccs(decoded.audio, decoded.sample_rate)
 
 
 def main(_):
     initialize_globals()
 
+    print('Reading input files and processing transcripts...')
     df = read_csvs(FLAGS.train_files.split(','))
     df.sort_values(by='wav_filesize', inplace=True)
     df['transcript'] = df['transcript'].apply(functools.partial(text_to_char_array, alphabet=Config.alphabet))
@@ -115,34 +103,54 @@ def main(_):
 
     num_gpus = len(Config.available_devices)
 
+    with_conv, _, _ = file_to_features('data/ldc93s1/LDC93S1.wav', [1, 2, 3])
+    with_conv = with_conv.numpy()
+
+    with_stride = file_to_mfccs('data/ldc93s1/LDC93S1.wav', [1, 2, 3]).numpy().squeeze(0)
+    num_strides = with_stride.shape[0]-2*Config.n_context
+    # Create a view into the array with overlapping strides of size
+    # numcontext (past) + 1 (present) + numcontext (future)
+    window_size = 2*Config.n_context+1
+    with_stride = np.lib.stride_tricks.as_strided(
+        with_stride,
+        (num_strides, window_size, Config.n_input),
+        (with_stride.strides[0], with_stride.strides[0], with_stride.strides[1]),
+        writeable=False)
+
+    print('conv shape:', with_conv.shape)
+    print('stride shape:', with_stride.shape)
+
+    # print('conv:', with_conv[0])
+    # print('stride:', with_stride[0])
+    print(np.allclose(with_conv, with_stride))
+
+    return
+
+    print('Creating input pipeline...')
     dataset = (tf.data.Dataset.from_generator(generate_values,
                                               output_types=(tf.string, tf.int32),
                                               output_shapes=([], [None]))
-                              .map(sample_to_features, num_parallel_calls=multiprocessing.cpu_count())
-                              .padded_batch(FLAGS.train_batch_size * num_gpus,
-                                            padded_shapes=([None, (2*Config.n_context + 1) * Config.n_input], [], [None]),
+                              .map(file_to_features, num_parallel_calls=multiprocessing.cpu_count())
+                              .prefetch(FLAGS.train_batch_size * num_gpus * 8)
+                              .cache()
+                              .padded_batch(FLAGS.train_batch_size,
+                                            padded_shapes=([None, (2*Config.n_context + 1), Config.n_input], [], [None]),
                                             drop_remainder=True)
                               .repeat(FLAGS.epoch)
-                              .prefetch(FLAGS.train_batch_size * num_gpus * 2)
               )
-
-    # strategy = tf.distribute.MirroredStrategy()
-    # with strategy.scope():
-    with tf.device('/cpu:0'):
-        model = create_model()
 
     batch_count = 0
     batch_size = None
+    batch_time = 0
+
     start_time = timer()
     for batch_x, batch_x_len, batch_y in dataset:
         batch_count += 1
         batch_size = batch_x.shape[0]
-        logits = model(batch_x)
         print('.', end='')
     total_time = timer() - start_time
     print()
-
-    print('iterating through dataset took {:0.3f}s, {} batches, {} epochs, batch size from dataset = {}'.format(total_time, batch_count, FLAGS.epoch, batch_size))
+    print('Iterating through dataset took {:.3f}s, {} batches, {} epochs, batch size from dataset = {}, average batch time = {:.3f}'.format(total_time, batch_count, FLAGS.epoch, batch_size, batch_time/batch_count))
 
 
 if __name__ == '__main__' :

@@ -19,6 +19,7 @@ import traceback
 from ds_ctcdecoder import ctc_beam_search_decoder, Scorer
 from six.moves import zip, range
 from tensorflow.python.tools import freeze_graph
+from timeit import default_timer as timer
 from util.audio import audiofile_to_input_vector
 from util.config import Config, initialize_globals
 from util.coordinator import TrainingCoordinator
@@ -30,9 +31,9 @@ from util.text import Alphabet
 
 #TODO: remove once fully switched to 1.13
 try:
-    from tensorflow.contrib.lite.python import tflite_convert # 1.12
+    import tensorflow.lite as lite # 1.13
 except ImportError:
-    from tensorflow.lite.python import tflite_convert # 1.13
+    import tensorflow.contrib.lite as lite # 1.12
 
 
 # Graph Creation
@@ -187,7 +188,7 @@ def calculate_mean_edit_distance_and_loss(model_feeder, tower, dropout, reuse):
     the decoded result and the batch's original Y.
     '''
     # Obtain the next batch of data
-    batch_x, batch_seq_len, batch_y = model_feeder.next_batch(tower)
+    batch_x, batch_seq_len, batch_y = model_feeder #.next_batch(tower)
 
     # Calculate the logits of the batch using BiRNN
     logits, _ = BiRNN(batch_x, batch_seq_len, dropout, reuse)
@@ -235,7 +236,7 @@ def create_optimizer():
 # on which all operations within the tower execute.
 # For example, all operations of 'tower 0' could execute on the first GPU `tf.device('/gpu:0')`.
 
-def get_tower_results(model_feeder, optimizer, dropout_rates):
+def get_tower_results(it, optimizer, dropout_rates):
     r'''
     With this preliminary step out of the way, we can for each GPU introduce a
     tower for which's batch we calculate and return the optimization gradients
@@ -258,9 +259,15 @@ def get_tower_results(model_feeder, optimizer, dropout_rates):
             with tf.device(device):
                 # Create a scope for all operations of tower i
                 with tf.name_scope('tower_%d' % i) as scope:
+                    next_x, next_x_len, next_y = it.get_next()
+                    next_y = tf.contrib.layers.dense_to_sparse(next_y)
+                    neg_ones = tf.SparseTensor(next_y.indices, -1 * tf.ones_like(next_y.values), next_y.dense_shape)
+                    next_y = tf.sparse_add(next_y, neg_ones)
+                    next_batch = next_x, next_x_len, next_y
+
                     # Calculate the avg_loss and mean_edit_distance and retrieve the decoded
                     # batch along with the original batch's labels (Y) of this tower
-                    avg_loss = calculate_mean_edit_distance_and_loss(model_feeder, i, dropout_rates, reuse=i>0)
+                    avg_loss = calculate_mean_edit_distance_and_loss(next_batch, i, dropout_rates, reuse=i>0)
 
                     # Allow for variables to be re-used by the next tower
                     tf.get_variable_scope().reuse_variables()
@@ -367,6 +374,66 @@ def send_token_to_ps(session, kill=False):
         session.run(enqueue, feed_dict={ Config.token_placeholder: token })
         log_debug('Sent %s token to ps %d.' % (kind, index))
 
+import functools
+import multiprocessing
+import pandas
+
+from tensorflow.contrib.framework.python.ops import audio_ops as contrib_audio
+from util.text import text_to_char_array
+
+def read_csvs(csv_files):
+    source_data = None
+    for csv in csv_files:
+        file = pandas.read_csv(csv, encoding='utf-8', na_filter=False)
+        #FIXME: not cross-platform
+        csv_dir = os.path.dirname(os.path.abspath(csv))
+        file['wav_filename'] = file['wav_filename'].str.replace(r'(^[^/])', lambda m: os.path.join(csv_dir, m.group(1)))
+        if source_data is None:
+            source_data = file
+        else:
+            source_data = source_data.append(file)
+    return source_data
+
+
+def samples_to_features(samples, sample_rate):
+    spectrogram = contrib_audio.audio_spectrogram(samples, window_size=512, stride=320, magnitude_squared=True)
+    mfccs = contrib_audio.mfcc(spectrogram, sample_rate, dct_coefficient_count=Config.n_input)
+
+    tf.print('mfcc shape:', tf.shape(mfccs))
+
+    # Add empty initial and final contexts
+    empty_context = tf.fill([1, Config.n_context, Config.n_input], 0.0)
+    mfccs = tf.concat([empty_context, mfccs, empty_context], 1)
+
+    tf.print('after ctx:', tf.shape(mfccs))
+
+    window_width = 2*Config.n_context + 1
+    num_channels = Config.n_input
+
+    # Create a constant convolution filter using an identity matrix, so that the
+    # convolution returns patches of the input tensor as is, and we can create
+    # overlapping windows over the MFCCs.
+    eye_filter = tf.constant(np.eye(window_width * num_channels)
+                               .reshape(window_width, num_channels, window_width * num_channels), tf.float32)
+
+    # Create overlapping windows
+    mfccs = tf.nn.conv1d(mfccs, eye_filter, stride=1, padding='VALID')
+
+    # Remove dummy depth dimension and reshape into n_windows, window_width, n_input
+    mfccs = tf.reshape(mfccs, [-1, window_width, num_channels])
+
+    tf.print('after windows:', tf.shape(mfccs))
+
+    return mfccs, tf.shape(mfccs)[0]
+
+
+def file_to_features(wav_filename, transcript):
+    samples = tf.read_file(wav_filename)
+    decoded = contrib_audio.decode_wav(samples, desired_channels=1)
+    features, features_len = samples_to_features(decoded.audio, decoded.sample_rate)
+
+    return features, features_len, transcript
+
 
 def train(server=None):
     r'''
@@ -418,6 +485,34 @@ def train(server=None):
                                Config.alphabet,
                                tower_feeder_count=len(Config.available_devices))
 
+    print('Reading input files and processing transcripts...')
+    df = read_csvs(FLAGS.train_files.split(','))
+    df.sort_values(by='wav_filesize', inplace=True)
+
+    # Add one to use zero as EOS token when converting to sparse
+    df['transcript'] = df['transcript'].apply(functools.partial(text_to_char_array, alphabet=Config.alphabet)) + 1
+
+    def generate_values():
+        for _, row in df.iterrows():
+            yield row.wav_filename, row.transcript
+
+    num_gpus = len(Config.available_devices)
+
+    print('Creating input pipeline...')
+    dataset = (tf.data.Dataset.from_generator(generate_values,
+                                              output_types=(tf.string, tf.int32),
+                                              output_shapes=([], [None]))
+                              .map(file_to_features, num_parallel_calls=multiprocessing.cpu_count())
+                              .prefetch(FLAGS.train_batch_size * num_gpus * 8)
+                              .cache()
+                              .padded_batch(FLAGS.train_batch_size,
+                                            padded_shapes=([None, (2*Config.n_context + 1), Config.n_input], [], [None]),
+                                            drop_remainder=True)
+                              .repeat()
+              )
+
+    it = dataset.make_one_shot_iterator()
+
     # Create the optimizer
     optimizer = create_optimizer()
 
@@ -428,7 +523,7 @@ def train(server=None):
                                                    total_num_replicas=FLAGS.replicas)
 
     # Get the data_set specific graph end-points
-    gradients, loss = get_tower_results(model_feeder, optimizer, dropout_rates)
+    gradients, loss = get_tower_results(it, optimizer, dropout_rates)
 
     # Average tower gradients across GPUs
     avg_tower_gradients = average_gradients(gradients)
@@ -461,13 +556,13 @@ def train(server=None):
         '''
         def after_create_session(self, session, coord):
             log_debug('Starting queue runners...')
-            model_feeder.start_queue_threads(session, coord)
+            # model_feeder.start_queue_threads(session, coord)
             log_debug('Queue runners started.')
 
         def end(self, session):
             # Closing the data_set queues
             log_debug('Closing queues...')
-            model_feeder.close_queues(session)
+            # model_feeder.close_queues(session)
             log_debug('Queues closed.')
 
             # Telling the ps that we are done
@@ -596,9 +691,14 @@ def train(server=None):
                         if session.should_stop():
                             break
 
-                        log_debug('Starting batch...')
+                        # log_debug('Starting batch...')
+                        # batch_start = timer()
+
                         # Compute the batch
                         _, current_step, batch_loss, step_summary = session.run([train_op, global_step, loss, step_summaries_op], **extra_params)
+
+                        # batch_time = timer() - batch_start
+                        # print('batch time: {:.3f}'.format(batch_time))
 
                         # Log step summaries
                         step_summary_writer.add_summary(step_summary, current_step)
@@ -665,8 +765,15 @@ def test():
 
 def create_inference_graph(batch_size=1, n_steps=16, tflite=False):
     # Input tensor will be of shape [batch_size, n_steps, 2*n_context+1, n_input]
-    input_tensor = tf.placeholder(tf.float32, [batch_size, n_steps if n_steps > 0 else None, 2*Config.n_context+1, Config.n_input], name='input_node')
-    seq_length = tf.placeholder(tf.int32, [batch_size], name='input_lengths')
+    input_tensor = tf.placeholder(tf.float32, [5312], name='input_node')
+    seq_length = tf.placeholder(tf.int32, [1], name='input_lengths')
+
+    features, _ = samples_to_features(tf.expand_dims(input_tensor, -1), 16000)
+
+    # Add batch dimension
+    features = tf.reshape(features, [batch_size, n_steps, 2*Config.n_context+1, Config.n_input])
+
+    print(features.shape)
 
     if not tflite:
         previous_state_c = variable_on_worker_level('previous_state_c', [batch_size, Config.n_cell_dim], initializer=None)
@@ -679,8 +786,8 @@ def create_inference_graph(batch_size=1, n_steps=16, tflite=False):
 
     no_dropout = [0.0] * 6
 
-    logits, layers = BiRNN(batch_x=input_tensor,
-                           seq_length=seq_length if FLAGS.use_seq_length else None,
+    logits, layers = BiRNN(batch_x=features,
+                           seq_length=seq_length // 320 if FLAGS.use_seq_length else None,
                            dropout=no_dropout,
                            batch_size=batch_size,
                            n_steps=n_steps,
@@ -785,7 +892,7 @@ def export():
                 os.makedirs(FLAGS.export_dir)
 
             def do_graph_freeze(output_file=None, output_node_names=None, variables_blacklist=None):
-                freeze_graph.freeze_graph_with_def_protos(
+                return freeze_graph.freeze_graph_with_def_protos(
                     input_graph_def=session.graph_def,
                     input_saver_def=saver.as_saver_def(),
                     input_checkpoint=checkpoint_path,
@@ -800,39 +907,17 @@ def export():
             if not FLAGS.export_tflite:
                 do_graph_freeze(output_file=output_graph_path, output_node_names=output_names, variables_blacklist='previous_state_c,previous_state_h')
             else:
-                temp_fd, temp_freeze = tempfile.mkstemp(dir=FLAGS.export_dir)
-                os.close(temp_fd)
-                do_graph_freeze(output_file=temp_freeze, output_node_names=output_names, variables_blacklist='')
+                frozen_graph = do_graph_freeze(output_node_names=output_names, variables_blacklist='')
                 output_tflite_path = os.path.join(FLAGS.export_dir, output_filename.replace('.pb', '.tflite'))
-                class TFLiteFlags():
-                    def __init__(self):
-                        self.graph_def_file = temp_freeze
-                        self.inference_type = 'FLOAT'
-                        self.input_arrays   = input_names
-                        self.input_shapes   = input_shapes
-                        self.output_arrays  = output_names
-                        self.output_file    = output_tflite_path
-                        self.output_format  = 'TFLITE'
-                        self.post_training_quantize = True
 
-                        default_empty = [
-                            'inference_input_type',
-                            'mean_values',
-                            'default_ranges_min', 'default_ranges_max',
-                            'drop_control_dependency',
-                            'reorder_across_fake_quant',
-                            'change_concat_input_ranges',
-                            'allow_custom_ops',
-                            'converter_mode',
-                            'dump_graphviz_dir',
-                            'dump_graphviz_video'
-                        ]
-                        for e in default_empty:
-                            self.__dict__[e] = None
+                converter = lite.TFLiteConverter(frozen_graph, input_tensors=inputs.values(), output_tensors=outputs.values())
+                # AudioSpectrogram and Mfcc ops are custom but have built-in kernels in TFLite
+                converter.allow_custom_ops = True
+                tflite_model = converter.convert()
 
-                flags = TFLiteFlags()
-                tflite_convert._convert_model(flags)
-                os.unlink(temp_freeze)
+                with open(output_tflite_path, 'wb') as fout:
+                    fout.write(tflite_model)
+
                 log_info('Exported model for TF Lite engine as {}'.format(os.path.basename(output_tflite_path)))
 
             log_info('Models exported at %s' % (FLAGS.export_dir))
