@@ -77,6 +77,21 @@ def BiRNN(batch_x, seq_length, dropout, reuse=False, batch_size=None, n_steps=-1
     if not batch_size:
         batch_size = tf.shape(batch_x)[0]
 
+    window_width = 2*Config.n_context + 1
+    num_channels = Config.n_input
+
+    # Create a constant convolution filter using an identity matrix, so that the
+    # convolution returns patches of the input tensor as is, and we can create
+    # overlapping windows over the MFCCs.
+    eye_filter = tf.constant(np.eye(window_width * num_channels)
+                               .reshape(window_width, num_channels, window_width * num_channels), tf.float32)
+
+    # Create overlapping windows
+    batch_x = tf.nn.conv1d(batch_x, eye_filter, stride=1, padding='SAME')
+
+    # Remove dummy depth dimension and reshape into [batch_size, n_windows, window_width, n_input]
+    batch_x = tf.reshape(batch_x, [batch_size, -1, window_width, num_channels])
+
     # Reshaping `batch_x` to a tensor with shape `[n_steps*batch_size, n_input + 2*n_input*n_context]`.
     # This is done to prepare the batch for input into the first layer which expects a tensor of rank `2`.
 
@@ -265,6 +280,8 @@ def get_tower_results(it, optimizer, dropout_rates):
                     next_y = tf.sparse_add(next_y, neg_ones)
                     next_batch = next_x, next_x_len, next_y
 
+                    # print('next_x shape:', tf.shape(next_x))
+
                     # Calculate the avg_loss and mean_edit_distance and retrieve the decoded
                     # batch along with the original batch's labels (Y) of this tower
                     avg_loss = calculate_mean_edit_distance_and_loss(next_batch, i, dropout_rates, reuse=i>0)
@@ -395,34 +412,12 @@ def read_csvs(csv_files):
     return source_data
 
 
-def samples_to_features(samples, sample_rate):
+def samples_to_mfccs(samples, sample_rate):
     spectrogram = contrib_audio.audio_spectrogram(samples, window_size=512, stride=320, magnitude_squared=True)
     mfccs = contrib_audio.mfcc(spectrogram, sample_rate, dct_coefficient_count=Config.n_input)
+    mfccs = tf.reshape(mfccs, [-1, Config.n_input])
 
-    tf.print('mfcc shape:', tf.shape(mfccs))
-
-    # Add empty initial and final contexts
-    empty_context = tf.fill([1, Config.n_context, Config.n_input], 0.0)
-    mfccs = tf.concat([empty_context, mfccs, empty_context], 1)
-
-    tf.print('after ctx:', tf.shape(mfccs))
-
-    window_width = 2*Config.n_context + 1
-    num_channels = Config.n_input
-
-    # Create a constant convolution filter using an identity matrix, so that the
-    # convolution returns patches of the input tensor as is, and we can create
-    # overlapping windows over the MFCCs.
-    eye_filter = tf.constant(np.eye(window_width * num_channels)
-                               .reshape(window_width, num_channels, window_width * num_channels), tf.float32)
-
-    # Create overlapping windows
-    mfccs = tf.nn.conv1d(mfccs, eye_filter, stride=1, padding='VALID')
-
-    # Remove dummy depth dimension and reshape into n_windows, window_width, n_input
-    mfccs = tf.reshape(mfccs, [-1, window_width, num_channels])
-
-    tf.print('after windows:', tf.shape(mfccs))
+    tf.print('mfccs shape:', tf.shape(mfccs))
 
     return mfccs, tf.shape(mfccs)[0]
 
@@ -430,7 +425,7 @@ def samples_to_features(samples, sample_rate):
 def file_to_features(wav_filename, transcript):
     samples = tf.read_file(wav_filename)
     decoded = contrib_audio.decode_wav(samples, desired_channels=1)
-    features, features_len = samples_to_features(decoded.audio, decoded.sample_rate)
+    features, features_len = samples_to_mfccs(decoded.audio, decoded.sample_rate)
 
     return features, features_len, transcript
 
@@ -452,12 +447,13 @@ def train(server=None):
     dropout_rates = [tf.placeholder(tf.float32, name='dropout_{}'.format(i)) for i in range(6)]
 
     # Reading training set
-    train_data = preprocess(FLAGS.train_files.split(','),
-                            FLAGS.train_batch_size,
-                            Config.n_input,
-                            Config.n_context,
-                            Config.alphabet,
-                            hdf5_cache_path=FLAGS.train_cached_features_path)
+    # train_data = preprocess(FLAGS.train_files.split(','),
+    #                         FLAGS.train_batch_size,
+    #                         Config.n_input,
+    #                         Config.n_context,
+    #                         Config.alphabet,
+    #                         hdf5_cache_path=FLAGS.train_cached_features_path)
+    train_data = read_csvs(FLAGS.train_files.split(','))
 
     train_set = DataSet(train_data,
                         FLAGS.train_batch_size,
@@ -465,12 +461,13 @@ def train(server=None):
                         next_index=lambda i: coord.get_next_index('train'))
 
     # Reading validation set
-    dev_data = preprocess(FLAGS.dev_files.split(','),
-                          FLAGS.dev_batch_size,
-                          Config.n_input,
-                          Config.n_context,
-                          Config.alphabet,
-                          hdf5_cache_path=FLAGS.dev_cached_features_path)
+    # dev_data = preprocess(FLAGS.dev_files.split(','),
+    #                       FLAGS.dev_batch_size,
+    #                       Config.n_input,
+    #                       Config.n_context,
+    #                       Config.alphabet,
+    #                       hdf5_cache_path=FLAGS.dev_cached_features_path)
+    dev_data = read_csvs(FLAGS.dev_files.split(','))
 
     dev_set = DataSet(dev_data,
                       FLAGS.dev_batch_size,
@@ -506,7 +503,7 @@ def train(server=None):
                               .prefetch(FLAGS.train_batch_size * num_gpus * 8)
                               .cache()
                               .padded_batch(FLAGS.train_batch_size,
-                                            padded_shapes=([None, (2*Config.n_context + 1), Config.n_input], [], [None]),
+                                            padded_shapes=([None, Config.n_input], [], [None]),
                                             drop_remainder=True)
                               .repeat()
               )
@@ -764,16 +761,15 @@ def test():
 
 
 def create_inference_graph(batch_size=1, n_steps=16, tflite=False):
+    # Create feature computation graph
+    input_samples = tf.placeholder(tf.float32, [512], name='input_samples')
+    input_samples = tf.reshape(input_samples, [512, 1])
+    mfccs, _ = samples_to_mfccs(input_samples, 16000)
+    mfccs = tf.identity(mfccs, name='mfccs')
+
     # Input tensor will be of shape [batch_size, n_steps, 2*n_context+1, n_input]
-    input_tensor = tf.placeholder(tf.float32, [5312], name='input_node')
-    seq_length = tf.placeholder(tf.int32, [1], name='input_lengths')
-
-    features, _ = samples_to_features(tf.expand_dims(input_tensor, -1), 16000)
-
-    # Add batch dimension
-    features = tf.reshape(features, [batch_size, n_steps, 2*Config.n_context+1, Config.n_input])
-
-    print(features.shape)
+    input_tensor = tf.placeholder(tf.float32, [batch_size, n_steps if n_steps > 0 else None, Config.n_input], name='input_node')
+    seq_length = tf.placeholder(tf.int32, [batch_size], name='input_lengths')
 
     if not tflite:
         previous_state_c = variable_on_worker_level('previous_state_c', [batch_size, Config.n_cell_dim], initializer=None)
@@ -786,7 +782,7 @@ def create_inference_graph(batch_size=1, n_steps=16, tflite=False):
 
     no_dropout = [0.0] * 6
 
-    logits, layers = BiRNN(batch_x=features,
+    logits, layers = BiRNN(batch_x=input_tensor,
                            seq_length=seq_length // 320 if FLAGS.use_seq_length else None,
                            dropout=no_dropout,
                            batch_size=batch_size,
@@ -818,10 +814,12 @@ def create_inference_graph(batch_size=1, n_steps=16, tflite=False):
             {
                 'input': input_tensor,
                 'input_lengths': seq_length,
+                'input_samples': input_samples,
             },
             {
                 'outputs': logits,
                 'initialize_state': initialize_state,
+                'mfccs': mfccs,
             },
             layers
         )
@@ -835,11 +833,13 @@ def create_inference_graph(batch_size=1, n_steps=16, tflite=False):
                 'input': input_tensor,
                 'previous_state_c': previous_state_c,
                 'previous_state_h': previous_state_h,
+                'input_samples': input_samples,
             },
             {
                 'outputs': logits,
                 'new_state_c': new_state_c,
                 'new_state_h': new_state_h,
+                'mfccs': mfccs,
             },
             layers
         )

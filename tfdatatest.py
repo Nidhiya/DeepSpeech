@@ -40,37 +40,38 @@ def samples_to_mfccs(samples, sample_rate):
 
     tf.print('mfcc shape:', tf.shape(mfccs))
 
-    # Add empty initial and final contexts
-    empty_context = tf.fill([1, Config.n_context, Config.n_input], 0.0)
-    mfccs = tf.concat([empty_context, mfccs, empty_context], 1)
+    # # Add empty initial and final contexts
+    # empty_context = tf.fill([1, Config.n_context, Config.n_input], 0.0)
+    # mfccs = tf.concat([empty_context, mfccs, empty_context], 1)
 
     return mfccs
 
 
 def samples_to_features(samples, sample_rate):
     mfccs = samples_to_mfccs(samples, sample_rate)
+    mfccs = tf.squeeze(mfccs, [0])
     # tf.print('after ctx:', tf.shape(mfccs))
 
-    window_width = 2*Config.n_context + 1
-    num_channels = Config.n_input
+    # window_width = 2*Config.n_context + 1
+    # num_channels = Config.n_input
 
-    tf.print('shape before conv:', tf.shape(mfccs))
+    # tf.print('shape before conv:', tf.shape(mfccs))
 
-    # Create a constant convolution filter using an identity matrix, so that the
-    # convolution returns patches of the input tensor as is, and we can create
-    # overlapping windows over the MFCCs.
-    eye_filter = tf.constant(np.eye(window_width * num_channels)
-                               .reshape(window_width, num_channels, window_width * num_channels), tf.float32)
+    # # Create a constant convolution filter using an identity matrix, so that the
+    # # convolution returns patches of the input tensor as is, and we can create
+    # # overlapping windows over the MFCCs.
+    # eye_filter = tf.constant(np.eye(window_width * num_channels)
+    #                            .reshape(window_width, num_channels, window_width * num_channels), tf.float32)
 
-    # Create overlapping windows
-    mfccs = tf.nn.conv1d(mfccs, eye_filter, stride=1, padding='VALID')
+    # # Create overlapping windows
+    # mfccs = tf.nn.conv1d(mfccs, eye_filter, stride=1, padding='SAME')
 
-    tf.print('shape after conv:', tf.shape(mfccs))
+    # tf.print('shape after conv:', tf.shape(mfccs))
 
-    # Remove dummy depth dimension and reshape into n_windows, window_width, window_height
-    mfccs = tf.reshape(mfccs, [-1, window_width, num_channels])
+    # # Remove dummy depth dimension and reshape into n_windows, window_width, window_height
+    # mfccs = tf.reshape(mfccs, [-1, window_width, num_channels])
 
-    # tf.print('after windows:', tf.shape(mfccs))
+    # # tf.print('after windows:', tf.shape(mfccs))
 
     return mfccs, tf.shape(mfccs)[0]
 
@@ -103,29 +104,6 @@ def main(_):
 
     num_gpus = len(Config.available_devices)
 
-    with_conv, _, _ = file_to_features('data/ldc93s1/LDC93S1.wav', [1, 2, 3])
-    with_conv = with_conv.numpy()
-
-    with_stride = file_to_mfccs('data/ldc93s1/LDC93S1.wav', [1, 2, 3]).numpy().squeeze(0)
-    num_strides = with_stride.shape[0]-2*Config.n_context
-    # Create a view into the array with overlapping strides of size
-    # numcontext (past) + 1 (present) + numcontext (future)
-    window_size = 2*Config.n_context+1
-    with_stride = np.lib.stride_tricks.as_strided(
-        with_stride,
-        (num_strides, window_size, Config.n_input),
-        (with_stride.strides[0], with_stride.strides[0], with_stride.strides[1]),
-        writeable=False)
-
-    print('conv shape:', with_conv.shape)
-    print('stride shape:', with_stride.shape)
-
-    # print('conv:', with_conv[0])
-    # print('stride:', with_stride[0])
-    print(np.allclose(with_conv, with_stride))
-
-    return
-
     print('Creating input pipeline...')
     dataset = (tf.data.Dataset.from_generator(generate_values,
                                               output_types=(tf.string, tf.int32),
@@ -134,7 +112,7 @@ def main(_):
                               .prefetch(FLAGS.train_batch_size * num_gpus * 8)
                               .cache()
                               .padded_batch(FLAGS.train_batch_size,
-                                            padded_shapes=([None, (2*Config.n_context + 1), Config.n_input], [], [None]),
+                                            padded_shapes=([None, Config.n_input], [], [None]),
                                             drop_remainder=True)
                               .repeat(FLAGS.epoch)
               )
@@ -145,6 +123,7 @@ def main(_):
 
     start_time = timer()
     for batch_x, batch_x_len, batch_y in dataset:
+        tf.print('batch x shape from iter: ', tf.shape(batch_x))
         batch_count += 1
         batch_size = batch_x.shape[0]
         print('.', end='')

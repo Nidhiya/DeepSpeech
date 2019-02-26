@@ -82,7 +82,7 @@ class DataSet(object):
     '''
     def __init__(self, data, batch_size, skip=0, limit=0, ascending=True, next_index=lambda i: i + 1):
         self.data = data
-        self.data.sort_values(by="features_len", ascending=ascending, inplace=True)
+        # self.data.sort_values(by="features_len", ascending=ascending, inplace=True)
         self.batch_size = batch_size
         self.next_index = next_index
         self.total_batches = int(ceil(len(self.data) / batch_size))
